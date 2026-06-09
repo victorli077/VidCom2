@@ -7,15 +7,20 @@ from transformers.models.qwen2_5_omni.modeling_qwen2_5_omni import (
     Qwen2_5OmniThinkerCausalLMOutputWithPast,
 )
 
-from token_compressor.fastvid import compute_keep_indices
+from token_compressor.fastvid import compress_video_features
+from token_compressor.qwen2_5_omni_vision_attention import get_video_features_with_attention_scores
 
 _OMNICOM2_TOKEN_STATS_ENV = "VIDCOM_TOKEN_STATS"
 _OMNICOM2_TOKEN_STATS_CASE_ENV = "VIDCOM_TOKEN_STATS_CASE"
 
-def _compute_keep_indices(
-    flat_features: Tensor, grid_thw: Tensor, spatial_merge_size: int, base_scale: float
-) -> Tensor:
-    return compute_keep_indices(flat_features, grid_thw, spatial_merge_size, base_scale)
+def _compress_video_features(
+    flat_features: Tensor,
+    grid_thw: Tensor,
+    spatial_merge_size: int,
+    base_scale: float,
+    attention_scores: Optional[Tensor] = None,
+) -> tuple[Tensor, Tensor]:
+    return compress_video_features(flat_features, grid_thw, spatial_merge_size, base_scale, attention_scores)
 
 def _count_tokens(input_ids: Optional[torch.LongTensor], attention_mask: Optional[torch.Tensor], config) -> dict:
     if input_ids is None:
@@ -117,7 +122,18 @@ def Qwen2_5_OmniThinker_forward(
         inputs_embeds = inputs_embeds.masked_scatter(image_mask, image_embeds)
 
     if pixel_values_videos is not None:
-        video_embeds = self.get_video_features(pixel_values_videos, video_grid_thw)
+        video_attention_scores = None
+        if os.getenv("BASELINE_USE_REAL_ATTENTION", "1") != "0":
+            try:
+                video_embeds, video_attention_scores = get_video_features_with_attention_scores(
+                    self.visual, pixel_values_videos, video_grid_thw
+                )
+            except Exception as exc:
+                if os.getenv("BASELINE_ATTENTION_DEBUG", "0") == "1":
+                    print(f"[fastvid] real attention extraction failed, falling back to norm: {exc}")
+                video_embeds = self.get_video_features(pixel_values_videos, video_grid_thw)
+        else:
+            video_embeds = self.get_video_features(pixel_values_videos, video_grid_thw)
         if isinstance(video_embeds, (list, tuple)):
             video_embeds = torch.cat(video_embeds, dim=0)
         video_embeds = video_embeds.to(inputs_embeds.device, inputs_embeds.dtype)
@@ -187,23 +203,32 @@ def Qwen2_5_OmniThinker_forward(
         split_sizes = (video_grid_thw.prod(-1) // merge_size**2).tolist()
 
         video_splits = torch.split(video_embeds, split_sizes)
+        attention_splits = (
+            torch.split(video_attention_scores.to(video_embeds.device), split_sizes)
+            if video_attention_scores is not None
+            else [None] * len(video_splits)
+        )
         kept_indices: List[Tensor] = []
         kept_video_chunks: List[Tensor] = []
         offset = 0
 
-        for grid, feat in zip(video_grid_thw, video_splits):
-            keep_local = _compute_keep_indices(
+        for grid, feat, attn_scores in zip(video_grid_thw, video_splits, attention_splits):
+            compressed_feat, keep_local = _compress_video_features(
                 flat_features=feat,
                 grid_thw=grid,
                 spatial_merge_size=merge_size,
                 base_scale=base_scale,
+                attention_scores=attn_scores,
             )
             kept_indices.append(keep_local + offset)
-            kept_video_chunks.append(feat[keep_local])
+            kept_video_chunks.append(compressed_feat)
             offset += feat.shape[0]
 
-        kept_indices = torch.sort(torch.cat(kept_indices)).values
+        kept_indices = torch.cat(kept_indices)
         video_embeds = torch.cat(kept_video_chunks, dim=0)
+        order = torch.argsort(kept_indices)
+        kept_indices = kept_indices[order]
+        video_embeds = video_embeds[order]
 
         video_token_positions = video_mask[..., 0][0].nonzero(as_tuple=False).squeeze(-1)
         kept_video_positions = video_token_positions[kept_indices]

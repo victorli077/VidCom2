@@ -108,6 +108,55 @@ class Qwen2_5_Omni(lmms):
 
             self._model.thinker.forward = types.MethodType(Qwen2_5_OmniThinker_forward, self._model.thinker)
             eval_logger.success("[VidCom2] Successfully integrated VidCom2 with Qwen2.5-Omni.")
+        elif os.getenv("COMPRESSOR") == "dycoke":
+            import types
+
+            from token_compressor.dycoke.models.qwen2_5_omni import Qwen2_5_OmniThinker_forward
+
+            self._model.thinker.forward = types.MethodType(Qwen2_5_OmniThinker_forward, self._model.thinker)
+            eval_logger.success("[DyCoKe] Successfully integrated DyCoKe with Qwen2.5-Omni.")
+        elif os.getenv("COMPRESSOR") == "fastvid":
+            import types
+
+            from token_compressor.fastvid.models.qwen2_5_omni import Qwen2_5_OmniThinker_forward
+
+            self._model.thinker.forward = types.MethodType(Qwen2_5_OmniThinker_forward, self._model.thinker)
+            eval_logger.success("[FastVid] Successfully integrated FastVid with Qwen2.5-Omni.")
+        elif os.getenv("COMPRESSOR") == "holitom":
+            import types
+
+            from token_compressor.holitom.models.qwen2_5_omni import Qwen2_5_OmniThinker_forward
+
+            self._model.thinker.forward = types.MethodType(Qwen2_5_OmniThinker_forward, self._model.thinker)
+            eval_logger.success("[HoliTom] Successfully integrated HoliTom with Qwen2.5-Omni.")
+        elif os.getenv("COMPRESSOR") == "visionzip":
+            import types
+
+            from token_compressor.visionzip.models.qwen2_5_omni import Qwen2_5_OmniThinker_forward
+
+            self._model.thinker.forward = types.MethodType(Qwen2_5_OmniThinker_forward, self._model.thinker)
+            eval_logger.success("[VisionZip] Successfully integrated VisionZip with Qwen2.5-Omni.")
+        elif os.getenv("COMPRESSOR") == "v_cast":
+            import types
+
+            from token_compressor.v_cast.models.qwen2_5_omni import Qwen2_5_OmniThinker_forward
+
+            self._model.thinker.forward = types.MethodType(Qwen2_5_OmniThinker_forward, self._model.thinker)
+            eval_logger.success("[V-CAST] Successfully integrated V-CAST with Qwen2.5-Omni.")
+        elif os.getenv("COMPRESSOR") == "random":
+            import types
+
+            from token_compressor.random.models.qwen2_5_omni import Qwen2_5_OmniThinker_forward
+
+            self._model.thinker.forward = types.MethodType(Qwen2_5_OmniThinker_forward, self._model.thinker)
+            eval_logger.success("[Random] Successfully integrated Random with Qwen2.5-Omni.")
+        elif os.getenv("COMPRESSOR") == "omnizip":
+            import types
+
+            from token_compressor.omnizip.models.qwen2_5_omni import Qwen2_5_OmniThinker_forward
+
+            self._model.thinker.forward = types.MethodType(Qwen2_5_OmniThinker_forward, self._model.thinker)
+            eval_logger.success("[OmniZip] Successfully integrated OmniZip with Qwen2.5-Omni.")
         self.processor = Qwen2_5OmniProcessor.from_pretrained("Qwen/Qwen2.5-Omni-7B")
         self.max_num_frames = max_num_frames
         self._tokenizer = self.processor.tokenizer
@@ -258,10 +307,13 @@ class Qwen2_5_Omni(lmms):
             # For better performance, please visit the Qwen-Omni repo to get the latest system prompt based on tasks.
             # https://github.com/QwenLM/Qwen2.5-Omni/tree/main/cookbooks
             message = [{"role": "system", "content": [{"type": "text", "text": self.system_prompt}]}]
+            source_video_path_for_viz = None
             for i, context in enumerate(contexts):
                 if len(visuals) > 0:
                     visual = visuals[i] if i < len(visuals) else None
                     if isinstance(visual, str) and visual.endswith((".mp4", ".avi", ".mov")):  # Video file
+                        if source_video_path_for_viz is None:
+                            source_video_path_for_viz = visual
                         current_use_audio = self._check_if_video_has_audio(visual)
                         if self.use_custom_video_loader:
                             visual = read_video_pyav_base64(visual, num_frm=self.max_num_frames, fps=self.fps, img_format="JPEG", max_image_size=self.max_image_size)
@@ -369,6 +421,9 @@ class Qwen2_5_Omni(lmms):
             pad_token_id = self.tokenizer.pad_token_id
 
             try:
+                thinker = getattr(self.model, "thinker", None)
+                if thinker is not None:
+                    thinker._vidcom2_source_video_path = source_video_path_for_viz
                 torch.cuda.reset_peak_memory_stats()
                 gen_start_event = torch.cuda.Event(enable_timing=True)
                 gen_end_event = torch.cuda.Event(enable_timing=True)

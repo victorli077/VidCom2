@@ -394,13 +394,15 @@ def holitom_segment_compression(
     dynamic_attn: torch.Tensor,
     static_pos: torch.Tensor,
     dynamic_pos: torch.Tensor,
+    segment_start: int,
     window_size: int,
+    seq_len: int,
     retain_ratio: float,
     D: float,
     beta: float,
     K: int,
     target_dtype: torch.dtype
-) -> torch.Tensor:
+) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     Apply HoliTom compression to a single temporal segment.
     
@@ -419,6 +421,7 @@ def holitom_segment_compression(
         
     Returns:
         feat: Compressed features for this segment [num_tokens, embed_dim]
+        pos: Representative global positions for compressed features [num_tokens]
     """
     if window_size == 1:
         # Single frame - only apply attention-based merging
@@ -426,21 +429,33 @@ def holitom_segment_compression(
             dynamic_feat, dynamic_attn, dynamic_pos, retain_ratio, D, beta, K
         )
         feat = dynamic_feat.flatten(0, 1)
+        pos = dynamic_pos.flatten(0, 1).to(dtype=torch.long) + int(segment_start) * int(seq_len)
     else:
         # Multi-frame - merge both static and dynamic
         dynamic_feat, dynamic_pos = merge_tokens_by_attention_density(
             dynamic_feat, dynamic_attn, dynamic_pos, retain_ratio, D, beta, K
         )
+        frame_offsets = (
+            torch.arange(window_size, device=dynamic_pos.device, dtype=torch.long).unsqueeze(1)
+            + int(segment_start)
+        ) * int(seq_len)
+        dynamic_global_pos = dynamic_pos.to(dtype=torch.long) + frame_offsets
         
         if static_feat.numel() > 0:
             static_feat, static_pos = merge_tokens_by_density(
                 static_feat.unsqueeze(0), static_pos, retain_ratio, beta, K
             )
+            # Static tokens are temporal merges; place them at the window midpoint.
+            static_global_pos = static_pos.flatten(0, 1).to(dtype=torch.long) + (
+                int(segment_start) + int(window_size) // 2
+            ) * int(seq_len)
             feat = torch.cat([static_feat.flatten(0, 1), dynamic_feat.flatten(0, 1)])
+            pos = torch.cat([static_global_pos, dynamic_global_pos.flatten(0, 1)])
         else:
             feat = dynamic_feat.flatten(0, 1)
+            pos = dynamic_global_pos.flatten(0, 1)
     
-    return feat.to(target_dtype)
+    return feat.to(target_dtype), pos.to(dtype=torch.long)
 
 
 def holitom_compression(
@@ -469,10 +484,13 @@ def holitom_compression(
         
     Returns:
         compressed_feat: Compressed video features [num_tokens, embed_dim]
-        keep_indices: Indices of kept tokens (approximation for compatibility)
+        keep_indices: Representative global positions of compressed tokens
     """
     num_frames, seq_len, embed_dim = video_feat.shape
     target_dtype = video_feat.dtype
+
+    if attn_weights is None:
+        attn_weights = video_feat.norm(dim=-1)
     
     # Compute frame-to-frame similarity
     video_feat_norm = F.normalize(video_feat.float(), p=2, dim=-1)
@@ -500,15 +518,18 @@ def holitom_compression(
     
     # Compress each segment
     segment_features = []
+    segment_positions = []
     for idx, (start, end) in enumerate(selected_frames):
         window_size = end - start + 1
-        segment_feat = holitom_segment_compression(
+        segment_feat, segment_pos = holitom_segment_compression(
             static_feats[idx],
             dynamic_feats[idx],
             dynamic_attns[idx],
             static_poses[idx],
             dynamic_poses[idx],
+            start,
             window_size,
+            seq_len,
             adjusted_ratio,
             D,
             beta,
@@ -516,14 +537,11 @@ def holitom_compression(
             target_dtype
         )
         segment_features.append(segment_feat)
+        segment_positions.append(segment_pos)
     
     compressed_feat = torch.cat(segment_features, dim=0)
-    
-    # Generate approximate keep indices (for compatibility with framework)
-    num_keep = compressed_feat.shape[0]
-    keep_indices = torch.linspace(0, num_frames * seq_len - 1, num_keep, dtype=torch.long, device=video_feat.device)
+    keep_indices = torch.cat(segment_positions, dim=0)
     
     return compressed_feat, keep_indices
-
 
 

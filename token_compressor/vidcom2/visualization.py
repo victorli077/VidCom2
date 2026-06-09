@@ -483,6 +483,10 @@ def save_budget_comparison_artifact(
             title=title,
         )
 
+    frame_tokens: Optional[int] = None
+    if extra_meta and "frame_tokens" in extra_meta:
+        frame_tokens = int(extra_meta["frame_tokens"])
+
     meta: Dict[str, Any] = {
         "case_name": case_name,
         "num_chunks": t,
@@ -502,6 +506,11 @@ def save_budget_comparison_artifact(
         "frame_source": frame_source,
         "plot_path": plot_saved,
     }
+
+    if frame_tokens is not None and frame_tokens > 0:
+        meta["curve_visual"] = [round(v / frame_tokens, 6) for v in budgets_visual[:t]]
+        meta["curve_audio"] = [round(v / frame_tokens, 6) for v in budgets_audio[:t]]
+        meta["curve_normalized_by"] = frame_tokens
     if extra_meta:
         meta.update(extra_meta)
 

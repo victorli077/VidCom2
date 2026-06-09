@@ -12,6 +12,128 @@ MODEL_SPECS = {
     "qwen3_vl": {"tpf": None, "mapper": "linear"},  # tpf provided dynamically
 }
 
+
+def get_audio_guided_frame_features(
+    video_grid_thw: torch.Tensor,
+    video_second_per_grid: float,
+    audio_embeds: torch.Tensor,
+    AUDIO_FPS: float,
+    context_tokens: int = 12,
+) -> torch.Tensor:
+    """Align audio tokens to each video grid frame and average them to per-frame features.
+
+    For each frame, use a context-extended window:
+      [frame_start - context_tokens, frame_end + context_tokens)
+    so the feature includes local temporal context around the current frame.
+    """
+    if audio_embeds.ndim != 2:
+        raise ValueError(f"audio_embeds must be 2D (audio_seq_len, hidden_dim), got {audio_embeds.shape}")
+
+    if torch.is_tensor(video_second_per_grid):
+        video_second_per_grid = float(video_second_per_grid.item())
+    else:
+        video_second_per_grid = float(video_second_per_grid)
+
+    t = int(video_grid_thw.reshape(-1)[0].item())
+    audio_seq_len, hidden_dim = audio_embeds.shape
+    frame_audio_features: List[torch.Tensor] = []
+
+    for frame_idx in range(t):
+        start_idx = int(frame_idx * video_second_per_grid * AUDIO_FPS)
+        end_idx = int((frame_idx + 1) * video_second_per_grid * AUDIO_FPS)
+
+        start_idx = max(0, min(start_idx, audio_seq_len))
+        end_idx = max(0, min(end_idx, audio_seq_len))
+
+        if end_idx <= start_idx:
+            frame_audio_features.append(
+                torch.zeros(hidden_dim, dtype=audio_embeds.dtype, device=audio_embeds.device)
+            )
+            continue
+
+        # Include neighboring tokens around the current frame window.
+        ext_start = max(0, start_idx - int(context_tokens))
+        ext_end = min(audio_seq_len, end_idx + int(context_tokens))
+        if ext_end <= ext_start:
+            frame_audio_features.append(
+                torch.zeros(hidden_dim, dtype=audio_embeds.dtype, device=audio_embeds.device)
+            )
+            continue
+
+        frame_audio_features.append(torch.mean(audio_embeds[ext_start:ext_end], dim=0))
+
+    if len(frame_audio_features) == 0:
+        return torch.zeros((0, hidden_dim), dtype=audio_embeds.dtype, device=audio_embeds.device)
+    return torch.stack(frame_audio_features, dim=0)
+
+
+def compute_audio_change_scores(
+    frame_audio_features: torch.Tensor,
+    window_scales: Optional[List[int]] = None,
+    eps: float = 1e-6,
+) -> torch.Tensor:
+    """
+    Compute per-frame audio novelty score using multiscale negative cosine similarity
+    across multiple temporal windows.
+
+    For each scale k in window_scales, compute bidirectional cosine change between
+    frames separated by k, weight by Gaussian kernel centered at scale=0, then sum.
+    Short scales capture transient audio events (door knocks, word boundaries);
+    long scales capture slow timbral/energy changes (background music fade).
+    A final global min-max normalization keeps output in a consistent range.
+
+    Args:
+        frame_audio_features: (num_frames, feat_dim) tensor of per-frame audio embeddings.
+        window_scales:       List of temporal offsets (in frames). Defaults to [1, 3].
+        eps:                 Numerical stability constant.
+
+    Returns:
+        (num_frames,) tensor of novelty scores; higher = more audio change at that frame.
+    """
+    if window_scales is None:
+        window_scales = [1,3]
+
+    num_frames = frame_audio_features.shape[0]
+    if num_frames == 0:
+        return torch.zeros(0, dtype=frame_audio_features.dtype, device=frame_audio_features.device)
+
+    normed = F.normalize(frame_audio_features, p=2, dim=-1, eps=eps)
+
+    sigma = window_scales[-1] / 3
+    combined = torch.zeros(num_frames, dtype=normed.dtype, device=normed.device)
+
+    for k in window_scales:
+        if k <= 0 or k >= num_frames:
+            continue
+
+        # scores[i] = -cos(frame[i], frame[i+k]) for frames that have a forward neighbor
+        #           = -cos(frame[i], frame[i-k]) for frames that have a backward neighbor
+        # Inner frames (with both neighbors) get the average of forward and backward.
+        scores = torch.zeros(num_frames, dtype=normed.dtype, device=normed.device)
+
+        # Forward neighbors: frame i vs frame i+k, valid for i in [0, num_frames-k-1]
+        cos_fwd = (normed[:num_frames - k] * normed[k:]).sum(dim=-1)   # [num_frames - k]
+        scores[:num_frames - k] += -cos_fwd
+
+        # Backward neighbors: frame i+k vs frame i, valid for i in [0, num_frames-k-1]
+        # scores[k + j] += -cos(frame[j+k], frame[j]) for j in [0, num_frames-k-1]
+        cos_bwd = (normed[k:] * normed[:num_frames - k]).sum(dim=-1)  # [num_frames - k]
+        scores[k:] += -cos_bwd
+
+        # Inner frames got both directions; divide by 2 to average.
+        inner_start, inner_end = k, num_frames - k
+        if inner_end > inner_start:
+            scores[inner_start:inner_end] *= 0.5
+
+        weight = torch.exp(
+            -torch.tensor(k, dtype=torch.float32, device=normed.device)
+            / (2.0 * sigma * sigma + eps)
+        )
+        combined += weight * scores
+
+    return combined
+
+
 def vidcom2_compression(flattened_feat: torch.Tensor, model: str = "llava_ov",
                         base_scale: float = 0.25, frame_token_len: Optional[int] = None,
                         img_feat: Optional[torch.Tensor] = None) -> torch.Tensor:
@@ -24,7 +146,7 @@ def vidcom2_compression(flattened_feat: torch.Tensor, model: str = "llava_ov",
     if tpf is None: raise ValueError(f"frame_token_len required for {model}")
 
     # 1. Feature Analysis (Vectorized Gaussian Scores)
-    sel_feat = select_low_var_channels(flattened_feat)
+    sel_feat, _ = select_low_var_channels(flattened_feat)
     vid_score, frame_score = compute_gaussian_scores(sel_feat, tpf)
 
     # 2. Score Fusion & Selection (Hardcoded: Outlier Retention)
@@ -35,12 +157,15 @@ def vidcom2_compression(flattened_feat: torch.Tensor, model: str = "llava_ov",
     # 3. Index Mapping (Routes to linear or grid mapper)
     return map_features(indices, flattened_feat, img_feat, spec)
 
-def select_low_var_channels(x: torch.Tensor, ratio: float = 0.5) -> torch.Tensor:
-    """Selects least informative channels (lowest variance)."""
+def select_low_var_channels(x: torch.Tensor, ratio: float = 0.5) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    Selects least informative channels (lowest variance).
+    Returns selected sub-tensor and the corresponding channel indices.
+    """
     variances = x.var(dim=0, unbiased=False)
     k = int(x.shape[-1] * ratio)
     _, topk_idx = torch.topk(variances, k=k, largest=False)
-    return x[:, topk_idx]
+    return x[:, topk_idx], topk_idx
 
 def compute_gaussian_scores(x: torch.Tensor, tpf: int) -> Tuple[torch.Tensor, torch.Tensor]:
     """Computes Gaussian similarity to Video and Frame centers."""

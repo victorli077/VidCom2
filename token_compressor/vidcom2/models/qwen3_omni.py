@@ -34,7 +34,7 @@ def _compute_keep_indices(
     if frame_tokens <= 0 or flat_features.numel() == 0:
         return torch.arange(flat_features.shape[0], device=flat_features.device)
 
-    sel_feat = select_low_var_channels(flat_features)
+    sel_feat, _ = select_low_var_channels(flat_features)
     vid_score, frame_score = compute_gaussian_scores(sel_feat, frame_tokens)
     scales = compute_scales(-vid_score.mean(dim=-1), base_scale)
     indices = select_outlier_indices(vid_score + frame_score, scales, frame_tokens)
@@ -89,12 +89,16 @@ def Qwen3_OmniThinker_forward(
             feature_attention_mask=feature_attention_mask,
             audio_feature_lengths=audio_feature_lengths,
         )
+        if isinstance(audio_features, tuple):
+            audio_features = audio_features[0]
         audio_features = audio_features.to(inputs_embeds.device, inputs_embeds.dtype)
         _, _, audio_mask = self.get_placeholder_mask(input_ids, inputs_embeds=inputs_embeds)
         inputs_embeds = inputs_embeds.masked_scatter(audio_mask, audio_features)
 
     if pixel_values is not None:
         image_embeds = self.get_image_features(pixel_values, image_grid_thw)
+        if isinstance(image_embeds, tuple):
+            image_embeds = image_embeds[0]
         image_embeds = image_embeds.to(inputs_embeds.device, inputs_embeds.dtype)
         image_mask, _, _ = self.get_placeholder_mask(
             input_ids, inputs_embeds=inputs_embeds, image_features=image_embeds
@@ -103,6 +107,8 @@ def Qwen3_OmniThinker_forward(
 
     if pixel_values_videos is not None:
         video_embeds = self.get_video_features(pixel_values_videos, video_grid_thw)
+        if isinstance(video_embeds, tuple):
+            video_embeds = video_embeds[0]
         video_embeds = video_embeds.to(inputs_embeds.device, inputs_embeds.dtype)
         _, video_mask, _ = self.get_placeholder_mask(
             input_ids, inputs_embeds=inputs_embeds, video_features=video_embeds

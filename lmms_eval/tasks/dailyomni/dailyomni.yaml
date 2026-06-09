@@ -1,0 +1,33 @@
+# Daily-Omni Benchmark
+#
+# Dataset: https://huggingface.co/datasets/liarliar/Daily-Omni
+# Paper:    (see https://github.com/Lliar-liar/Daily-Omni)
+#
+# 1,197 QA pairs across 8 major categories, 13 reasoning types.
+# Each question requires synergistic audio-visual reasoning on daily videos.
+#
+# Dataset columns:
+#   Question, Choice, Answer, video_id, Type,
+#   content_parent_category, content_fine_category,
+#   video_category, video_duration, Explanation
+#
+# Video storage: the Videos.tar archive extracts to:
+#   {HF_HOME}/Daily-Omni/Videos/{video_id}/{video_id}_video.mp4
+# e.g. /mnt/workspace/lijiasheng-20260417/.cache/huggingface/Daily-Omni/Videos/Ec_lQgZ9wlg/Ec_lQgZ9wlg_video.mp4
+#
+# Each video folder also contains:
+#   {video_id}_audio.wav          - extracted audio
+#   QAs_revise.json / QAs_advance_deepseek.json  - per-video QA pairs
+#
+# Run with:
+#   python -m lmms_eval --model <model_name> --tasks dailyomni
+
+task: "dailyomni"
+
+dataset_kwargs:
+  token: true
+  cache_dir: Daily-Omni
+  video: true
+
+
+include: _default.yaml

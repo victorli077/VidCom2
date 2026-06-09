@@ -26,7 +26,7 @@ def _compute_keep_indices(
     if frame_tokens <= 0 or flat_features.numel() == 0:
         return torch.arange(flat_features.shape[0], device=flat_features.device)
 
-    sel_feat = select_low_var_channels(flat_features)
+    sel_feat, _ = select_low_var_channels(flat_features)
     vid_score, frame_score = compute_gaussian_scores(sel_feat, frame_tokens)
     scales = compute_scales(-vid_score.mean(dim=-1), base_scale)
     indices = select_outlier_indices(vid_score + frame_score, scales, frame_tokens)

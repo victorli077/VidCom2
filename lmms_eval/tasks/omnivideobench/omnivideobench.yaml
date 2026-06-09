@@ -1,0 +1,24 @@
+# OmniVideoBench Benchmark
+#
+# Dataset: https://huggingface.co/datasets/NJU-LINK/OmniVideoBench
+# Paper:   https://arxiv.org/abs/2510.10689
+#
+# 1,000 QA pairs across 628 videos, 8 major categories, 13 reasoning types.
+# Each question requires synergistic audio-visual reasoning.
+#
+# Dataset columns:
+#   question, question_type, audio_type, reasoning_steps, answer,
+#   options, correct_option, video, video_type, duration
+#
+# Run with:
+#   python -m lmms_eval --model <model_name> --tasks omnivideobench
+
+task: "omnivideobench"
+
+dataset_kwargs:
+  token: true
+  cache_dir: OmniVideoBench
+  video: true
+  create_link: true
+
+include: _default.yaml
