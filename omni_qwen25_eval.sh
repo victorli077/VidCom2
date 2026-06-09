@@ -5,7 +5,7 @@ set -euo pipefail
 # Override these variables on the command line if needed, e.g.
 #   TASK_NAMES="videomme" RETAIN_RATIOS="0.35 0.45" bash examples/omni_qwen25_random_eval.sh
 
-TASK_NAMES="${TASK_NAMES:-avut omnivideobench lvomnibench}"
+TASK_NAMES="${TASK_NAMES:-worldsense dailyomni av_speakerbench_audiovisual avut omnivideobench lvomnibench}"
 RETAIN_RATIOS="${RETAIN_RATIOS:-0.25}"
 METHOD_NAMES="${METHOD_NAMES:-vidcom2}"
 

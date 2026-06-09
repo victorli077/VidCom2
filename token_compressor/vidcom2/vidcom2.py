@@ -136,23 +136,38 @@ def compute_audio_change_scores(
 
 def vidcom2_compression(flattened_feat: torch.Tensor, model: str = "llava_ov",
                         base_scale: float = 0.25, frame_token_len: Optional[int] = None,
-                        img_feat: Optional[torch.Tensor] = None) -> torch.Tensor:
+                        img_feat: Optional[torch.Tensor] = None,
+                        frame_width: Optional[int] = None) -> torch.Tensor:
     """Compression pipeline supporting llava_ov, llava_vid, qwen2_vl, qwen2_5_vl, and qwen3_vl."""
     if model not in MODEL_SPECS: raise ValueError(f"Unknown model: {model}")
-    
+
     spec = MODEL_SPECS[model]
     # Use dynamic tpf for qwen2_vl/qwen2_5_vl/qwen3_vl, else use constant from spec
     tpf = frame_token_len if model in {"qwen2_vl", "qwen2_5_vl", "qwen3_vl"} else spec["tpf"]
     if tpf is None: raise ValueError(f"frame_token_len required for {model}")
+    # Frame grid width (square LLaVA frames default to sqrt(tpf); Qwen passes real width)
+    fw = frame_width if frame_width is not None else round(tpf ** 0.5)
 
     # 1. Feature Analysis (Vectorized Gaussian Scores)
     sel_feat, _ = select_low_var_channels(flattened_feat)
     vid_score, frame_score = compute_gaussian_scores(sel_feat, tpf)
 
-    # 2. Score Fusion & Selection (Hardcoded: Outlier Retention)
-    # Strategy: Keep tokens different from both Global Video Mean and Local Frame Mean
-    scales = compute_scales(-vid_score.mean(dim=-1), base_scale)
-    indices = select_outlier_indices(vid_score + frame_score, scales, tpf)
+    local_variation = -compute_local_variation(sel_feat, tpf).squeeze(-1)
+    local_variation_norm = (local_variation - local_variation.min()) / (local_variation.max() - local_variation.min() + 1e-8)
+    global_uniqueness = -vid_score.mean(dim=-1)
+    global_uniqueness_norm = (global_uniqueness - global_uniqueness.min()) / (global_uniqueness.max() - global_uniqueness.min() + 1e-8)
+
+    combined_tail = (global_uniqueness_norm[1:] + local_variation_norm) / 2
+    frame_budgeting = torch.cat([global_uniqueness_norm[0:1], combined_tail])  # the more unique, the higher the frame_budgeting
+
+    # 2. Score Fusion & Selection: uniform backbone + non-overlapping outliers
+    # Strategy: Keep a uniform backbone for coverage, plus tokens different from
+    # both the Global Video Mean and the Local Frame Mean (outliers).
+    backbone_indices = select_backbone_indices(tpf, fw, base_scale * 0.5, flattened_feat.device)
+    scales = compute_scales(frame_budgeting, base_scale * 0.5, temp=0.15)
+    outlier_indices = select_outlier_indices(vid_score + frame_score, scales, tpf,
+                                            exclude=backbone_indices)
+    indices = [torch.cat([backbone_indices, ol]).unique() for ol in outlier_indices]
 
     # 3. Index Mapping (Routes to linear or grid mapper)
     return map_features(indices, flattened_feat, img_feat, spec)
@@ -186,20 +201,60 @@ def _multi_scale_gaussian(x: torch.Tensor, center: torch.Tensor, alphas: List[fl
     dist_sq = ((x - center) ** 2).sum(dim=-1)
     return sum(torch.exp(-dist_sq / (2 * a)) for a in alphas)
 
+def compute_local_variation(x: torch.Tensor, tpf: int) -> torch.Tensor:
+    """Computes local variation of the feature."""
+    frames = x.view(-1, tpf, x.shape[-1])
+    frames = F.normalize(frames, dim=-1)
+    frame_center = frames.mean(dim=1, keepdim=True)
+    alphas = [2**k for k in range(-3, 2)]
+    return _multi_scale_gaussian(frame_center[:-1], frame_center[1:], alphas)
+
+
 def compute_scales(scores: torch.Tensor, base: float, temp: float = 0.01) -> torch.Tensor:
     """Generates dynamic retention rates based on frame importance."""
     probs = F.softmax((scores - scores.max()) / temp, dim=0)
     scales = base * (1 + probs - probs.mean())
     return scales.clamp(max=1.0)
 
-def select_outlier_indices(scores: torch.Tensor, scales: torch.Tensor, tpf: int) -> List[torch.Tensor]:
-    """Selects top-k indices with lowest similarity (largest outliers)."""
+
+def select_backbone_indices(tpf: int, frame_width: int, ratio: float,
+                            device: torch.device) -> torch.Tensor:
+    """Uniformly retains ~ratio*tpf tokens via 2D-grid subsampling.
+
+    The frame is an (H x W) token grid (flat index t -> row t//W, col t%W). We keep
+    n_h = round(H*sqrt(ratio)) evenly-spaced rows and n_w = round(W*sqrt(ratio))
+    evenly-spaced columns, then their grid intersection (~H*W*ratio tokens). At
+    ratio=0.25 this is exactly the top-left token of every 2x2 block.
+    """
+    h = max(1, tpf // frame_width)
+    side = ratio ** 0.5
+    n_h = max(1, min(h, round(h * side)))
+    n_w = max(1, min(frame_width, round(frame_width * side)))
+    rows = (torch.arange(n_h, device=device) * h) // n_h
+    cols = (torch.arange(n_w, device=device) * frame_width) // n_w
+    grid = rows.unsqueeze(1) * frame_width + cols.unsqueeze(0)
+    return grid.flatten().sort().values
+
+
+def select_outlier_indices(scores: torch.Tensor, scales: torch.Tensor, tpf: int,
+                           exclude: Optional[torch.Tensor] = None) -> List[torch.Tensor]:
+    """Selects top-k indices with lowest similarity (largest outliers).
+
+    Tokens in `exclude` (e.g. backbone indices) are never picked, so the result
+    does not overlap with the backbone selection.
+    """
     ks = (scales * tpf).round().long().clamp(min=1).tolist()
+    n_excl = 0 if exclude is None else exclude.numel()
     batch_indices = []
     for i, k in enumerate(ks):
+        s = scores[i]
+        if exclude is not None:
+            s = s.clone()
+            s[exclude] = float("inf")  # exclude from largest=False topk
+        k = min(k, tpf - n_excl)
         # largest=False -> retain most distinct tokens
-        _, idx = torch.topk(scores[i], k=k, largest=False, sorted=False)
-        batch_indices.append(idx.sort().values) 
+        _, idx = torch.topk(s, k=k, largest=False, sorted=False)
+        batch_indices.append(idx.sort().values)
     return batch_indices
 
 def map_features(indices: List[torch.Tensor], flat: torch.Tensor, 

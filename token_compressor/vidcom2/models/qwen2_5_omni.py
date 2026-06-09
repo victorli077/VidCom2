@@ -13,6 +13,8 @@ from token_compressor.vidcom2 import (
     compute_gaussian_scores,
     compute_scales,
     select_outlier_indices,
+    compute_local_variation,
+    select_backbone_indices,
     get_audio_guided_frame_features,
     compute_audio_change_scores,
     _map_linear_offset,
@@ -236,8 +238,16 @@ def _compute_keep_indices(
 
     sel_feat, selected_channels = select_low_var_channels(flat_features)
     vid_score, frame_score = compute_gaussian_scores(sel_feat, frame_tokens)
-    u_video = -vid_score.mean(dim=-1)
-    fused_frame_scores = u_video
+
+    local_variation = -compute_local_variation(sel_feat, frame_tokens).squeeze(-1)
+    local_variation_norm = (local_variation - local_variation.min()) / (local_variation.max() - local_variation.min() + 1e-8)
+    global_uniqueness = -vid_score.mean(dim=-1)
+    global_uniqueness_norm = (global_uniqueness - global_uniqueness.min()) / (global_uniqueness.max() - global_uniqueness.min() + 1e-8)
+
+    combined_tail = (global_uniqueness_norm[1:] + local_variation_norm) / 2
+    frame_budgeting = torch.cat([global_uniqueness_norm[0:1], combined_tail])
+
+    fused_frame_scores = frame_budgeting
     visual_token_scores = vid_score + frame_score
     fused_token_scores = visual_token_scores
 
@@ -261,11 +271,10 @@ def _compute_keep_indices(
                 clip_c=audio_robust_clip,
             )
             fused_frame_scores = _fuse_video_audio_scores(
-                u_video=u_video,
+                u_video=frame_budgeting,
                 u_audio=u_audio,
                 audio_weight=audio_weight_frame,
             )
-            # Optional switch: audio can guide budget only (frame scales), while token ranking stays visual-only.
             if enable_audio_token_guidance:
                 token_features = sel_feat.view(-1, frame_tokens, sel_feat.shape[-1])
                 fused_token_scores = _fuse_visual_audio_token_scores(
@@ -277,8 +286,15 @@ def _compute_keep_indices(
                     selected_channels=selected_channels,
                 )
 
-    scales = compute_scales(fused_frame_scores, base_scale)
-    indices = select_outlier_indices(fused_token_scores, scales, frame_tokens)
+    backbone_ratio = base_scale * 0.5
+    backbone_indices = select_backbone_indices(
+        frame_tokens, w, backbone_ratio, flat_features.device
+    )
+    scales = compute_scales(fused_frame_scores, backbone_ratio, temp=0.15)
+    outlier_indices = select_outlier_indices(
+        fused_token_scores, scales, frame_tokens, exclude=backbone_indices
+    )
+    indices = [torch.cat([backbone_indices, ol]).unique() for ol in outlier_indices]
     return _map_linear_offset(indices, frame_tokens)
 
 
@@ -445,8 +461,8 @@ def Qwen2_5_OmniThinker_forward(
 
         merge_size = self.visual.spatial_merge_size
         base_scale = float(os.getenv("R_RATIO", "0.25"))
-        enable_audio_guidance = _env_flag(_VIDCOM_AUDIO_GUIDANCE_ENV, default=True)
-        enable_audio_token_guidance = _env_flag(_VIDCOM_AUDIO_TOKEN_GUIDANCE_ENV, default=True)
+        enable_audio_guidance = _env_flag(_VIDCOM_AUDIO_GUIDANCE_ENV, default=False)
+        enable_audio_token_guidance = _env_flag(_VIDCOM_AUDIO_TOKEN_GUIDANCE_ENV, default=False)
         audio_fps = float(os.getenv(_VIDCOM_AUDIO_FPS_ENV, "25.0"))
         audio_robust_clip = _AUDIO_ROBUST_CLIP
         audio_weight_frame = 1.0
@@ -508,9 +524,22 @@ def Qwen2_5_OmniThinker_forward(
                     sel0, sel_channels0 = select_low_var_channels(feat0)
                     v0, f0 = compute_gaussian_scores(sel0, tpf0)
                     visual_token_scores0 = v0 + f0
-                    u_video0 = -v0.mean(dim=-1)
-                    scales_visual0 = compute_scales(u_video0, base_scale)
-                    budget_visual0 = _compute_budget_counts(visual_token_scores0, scales_visual0, tpf0)
+
+                    local_v0 = -compute_local_variation(sel0, tpf0).squeeze(-1)
+                    local_v_norm0 = (local_v0 - local_v0.min()) / (local_v0.max() - local_v0.min() + 1e-8)
+                    global_u0 = -v0.mean(dim=-1)
+                    global_u_norm0 = (global_u0 - global_u0.min()) / (global_u0.max() - global_u0.min() + 1e-8)
+
+                    combined_tail0 = (global_u_norm0[1:] + local_v_norm0) / 2
+                    frame_budgeting0 = torch.cat([global_u_norm0[0:1], combined_tail0])
+
+                    backbone_ratio = base_scale * 0.5
+                    backbone_count_viz = select_backbone_indices(
+                        tpf0, w0, backbone_ratio, feat0.device
+                    ).shape[0]
+                    scales_visual0 = compute_scales(frame_budgeting0, backbone_ratio, temp=0.15)
+                    outlier_budget_visual0 = _compute_budget_counts(visual_token_scores0, scales_visual0, tpf0)
+                    budget_visual0 = [backbone_count_viz + ob for ob in outlier_budget_visual0]
 
                     budget_audio0 = budget_visual0
                     audio_token_norm0 = None
@@ -526,7 +555,7 @@ def Qwen2_5_OmniThinker_forward(
                             audio_embeds=audio_features,
                             AUDIO_FPS=audio_fps,
                         )
-                        if frame_audio0.shape[0] == u_video0.shape[0]:
+                        if frame_audio0.shape[0] == frame_budgeting0.shape[0]:
                             raw_audio_novelty0 = compute_audio_change_scores(frame_audio0)
                             u_audio0 = _prepare_audio_novelty_scores(
                                 raw_novelty=raw_audio_novelty0,
@@ -536,11 +565,12 @@ def Qwen2_5_OmniThinker_forward(
                                 float(v) for v in u_audio0.detach().float().cpu().tolist()
                             ]
                             fused_frame0 = _fuse_video_audio_scores(
-                                u_video=u_video0,
+                                u_video=frame_budgeting0,
                                 u_audio=u_audio0,
                                 audio_weight=audio_weight_frame,
                             )
-                            scales_audio0 = compute_scales(fused_frame0, base_scale)
+                            scales_audio0 = compute_scales(fused_frame0, base_scale * 0.5, temp=0.15)
+                            backbone_count = backbone_count_viz
                             if enable_audio_token_guidance:
                                 token_feat0 = sel0.view(-1, tpf0, sel0.shape[-1])
                                 fused_token0 = _fuse_visual_audio_token_scores(
@@ -551,9 +581,11 @@ def Qwen2_5_OmniThinker_forward(
                                     audio_weight=audio_weight_token,
                                     selected_channels=sel_channels0,
                                 )
-                                budget_audio0 = _compute_budget_counts(fused_token0, scales_audio0, tpf0)
+                                outlier_budget = _compute_budget_counts(fused_token0, scales_audio0, tpf0)
+                                budget_audio0 = [backbone_count + ob for ob in outlier_budget]
                             else:
-                                budget_audio0 = _compute_budget_counts(visual_token_scores0, scales_audio0, tpf0)
+                                outlier_budget = _compute_budget_counts(visual_token_scores0, scales_audio0, tpf0)
+                                budget_audio0 = [backbone_count + ob for ob in outlier_budget]
 
                     case_name = f"case_{case_idx:06d}"
                     save_budget_comparison_artifact(
