@@ -18,7 +18,7 @@ def get_audio_guided_frame_features(
     video_second_per_grid: float,
     audio_embeds: torch.Tensor,
     AUDIO_FPS: float,
-    context_tokens: int = 12,
+    context_tokens: int = 25,
 ) -> torch.Tensor:
     """Align audio tokens to each video grid frame and average them to per-frame features.
 
@@ -77,7 +77,7 @@ def compute_audio_change_scores(
     across multiple temporal windows.
 
     For each scale k in window_scales, compute bidirectional cosine change between
-    frames separated by k, weight by Gaussian kernel centered at scale=0, then sum.
+    frames separated by k, weight by hardcoded weights [3.9,1], then sum.
     Short scales capture transient audio events (door knocks, word boundaries);
     long scales capture slow timbral/energy changes (background music fade).
     A final global min-max normalization keeps output in a consistent range.
@@ -92,17 +92,16 @@ def compute_audio_change_scores(
     """
     if window_scales is None:
         window_scales = [1,3]
-
+    weights = [3.9,1]
+    
     num_frames = frame_audio_features.shape[0]
     if num_frames == 0:
         return torch.zeros(0, dtype=frame_audio_features.dtype, device=frame_audio_features.device)
 
     normed = F.normalize(frame_audio_features, p=2, dim=-1, eps=eps)
-
-    sigma = window_scales[-1] / 3
     combined = torch.zeros(num_frames, dtype=normed.dtype, device=normed.device)
 
-    for k in window_scales:
+    for idx, k in enumerate(window_scales):
         if k <= 0 or k >= num_frames:
             continue
 
@@ -125,9 +124,8 @@ def compute_audio_change_scores(
         if inner_end > inner_start:
             scores[inner_start:inner_end] *= 0.5
 
-        weight = torch.exp(
-            -torch.tensor(k, dtype=torch.float32, device=normed.device)
-            / (2.0 * sigma * sigma + eps)
+       weight = torch.tensor(
+            weights[idx], dtype=torch.float32, device=normed.device
         )
         combined += weight * scores
 
