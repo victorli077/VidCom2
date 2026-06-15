@@ -85,7 +85,6 @@ def compute_audio_change_scores(
     Args:
         frame_audio_features: (num_frames, feat_dim) tensor of per-frame audio embeddings.
         window_scales:       List of temporal offsets (in frames). Defaults to [1, 3].
-        eps:                 Numerical stability constant.
 
     Returns:
         (num_frames,) tensor of novelty scores; higher = more audio change at that frame.
